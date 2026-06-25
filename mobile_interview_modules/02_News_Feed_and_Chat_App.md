@@ -104,6 +104,34 @@ Images are the #1 performance killer in feed apps. Here's how to handle them lik
 - **Recycled views**: As a post scrolls off screen, reuse its image view for the next post (RecyclerView / UICollectionView)
 - **Memory-aware caching**: Two-level cache — fast in-memory (LRU, ~50MB) + slower disk cache (~200MB). Check memory first, then disk, then network.
 
+**In React Native specifically — use `react-native-fast-image`:**
+
+```tsx
+import FastImage from 'react-native-fast-image';
+
+<FastImage
+  source={{
+    uri: post.imageUrl,
+    priority: FastImage.priority.normal,
+    cache: FastImage.cacheControl.immutable, // CDN images never change — cache forever
+  }}
+  style={styles.postImage}
+  resizeMode={FastImage.resizeMode.cover}
+/>
+```
+
+`react-native-fast-image` wraps SDWebImage (iOS) and Glide (Android) — the same battle-tested image libraries that native apps use. You get automatic disk caching, memory LRU eviction, request deduplication (two cells requesting the same image only fire one network request), and progressive loading.
+
+For a blurry placeholder while the real image loads, pair it with a small low-res thumbnail from your CDN:
+
+```tsx
+// Show a 20px blurred thumbnail until the full image loads
+<FastImage source={{ uri: post.thumbnailUrl }} style={[styles.postImage, styles.blur]} blurRadius={10} />
+<FastImage source={{ uri: post.imageUrl }} style={[styles.postImage, StyleSheet.absoluteFill]} />
+```
+
+The server generates the thumbnail once and includes its URL in the feed response. Zero extra client-side work.
+
 #### 2. 🔄 Optimistic Updates
 
 When a user taps "like":
@@ -112,6 +140,42 @@ When a user taps "like":
 3. If it fails? Quietly revert the UI and show a subtle error
 
 This makes the app feel *instant* even on 3G. Instagram does exactly this.
+
+**In React Native with React Query — this is almost trivial:**
+
+```typescript
+const { mutate: likePost } = useMutation({
+  mutationFn: (postId: string) => api.likePost(postId),
+
+  onMutate: async (postId) => {
+    // Cancel in-flight fetches to prevent overwriting our optimistic update
+    await queryClient.cancelQueries({ queryKey: ['feed'] });
+    const previousFeed = queryClient.getQueryData<FeedPost[]>(['feed']);
+
+    // Optimistically update the cache right now
+    queryClient.setQueryData<FeedPost[]>(['feed'], (old = []) =>
+      old.map(post =>
+        post.id === postId
+          ? { ...post, isLikedByMe: true, likesCount: post.likesCount + 1 }
+          : post
+      )
+    );
+    return { previousFeed }; // snapshot for rollback
+  },
+
+  onError: (_, __, context) => {
+    // Something went wrong — silently roll back
+    queryClient.setQueryData(['feed'], context?.previousFeed);
+  },
+
+  onSettled: () => {
+    // Always re-sync with server after mutation completes (success or failure)
+    queryClient.invalidateQueries({ queryKey: ['feed'] });
+  },
+});
+```
+
+The key point to emphasize in an interview: React Query handles the snapshot, rollback, and re-sync — the developer writes the *what* (update this post's like state), not the *how* (manually manage three loading states and undo logic).
 
 #### 3. 📡 Feed Refresh Strategy
 
@@ -137,6 +201,127 @@ The hybrid approach is what most real apps use. Say that in your interview.
 3. **No internet?** Show whatever's in the DB with a subtle "You're offline" banner
 
 The local database is your **single source of truth**. The UI never talks to the network directly — it only watches the database. The network writes TO the database. This is the magic of UDF (Unidirectional Data Flow).
+
+---
+
+### Q: What are the offline storage options in React Native — which one do I pick?
+
+**A:**
+
+| Need | Library | Why |
+|------|---------|-----|
+| Simple key-value (tokens, flags, prefs) | **MMKV** | 10× faster than AsyncStorage, **synchronous** reads — critical for tokens you need at app boot |
+| Large structured data (posts, messages) | **WatermelonDB** | SQLite-backed, reactive, built for 10k+ record datasets |
+| Medium structured data (simpler setup) | **react-native-sqlite-storage + Drizzle ORM** | Direct SQLite with type-safe queries, good for most apps |
+| Persisted server cache | **React Query + MMKV persister** | Persist the query cache to MMKV — next app launch gets instant data before network |
+| Files, videos, documents | **react-native-fs** | Read/write files in the app sandbox; pairs with `react-native-background-upload` |
+| Secrets / auth tokens | **react-native-keychain** | iOS Keychain / Android Keystore — hardware-backed, biometric unlock support |
+
+**The MMKV pitch in an interview:**
+
+*"For simple key-value storage I'd use MMKV instead of AsyncStorage. AsyncStorage is async and JS-based — every read is a promise. MMKV is a C++ key-value store with synchronous reads, which matters when you need the auth token immediately on app boot to decide whether to show the login screen."*
+
+```typescript
+import { MMKV } from 'react-native-mmkv';
+
+const storage = new MMKV();
+
+// Synchronous — no await
+storage.set('authToken', 'eyJhbGc...');
+const token = storage.getString('authToken'); // immediate read
+```
+
+**For feed offline support** — persist the React Query cache:
+
+```typescript
+import { createSyncStoragePersister } from '@tanstack/query-sync-storage-persister';
+import { persistQueryClient } from '@tanstack/react-query-persist-client';
+
+const persister = createSyncStoragePersister({
+  storage: {
+    getItem: (key) => storage.getString(key) ?? null,
+    setItem: (key, value) => storage.set(key, value),
+    removeItem: (key) => storage.delete(key),
+  },
+});
+
+persistQueryClient({ queryClient, persister, maxAge: 1000 * 60 * 60 * 24 }); // 24h
+```
+
+Now when the user opens the app offline, they see yesterday's feed immediately — no loading spinner.
+
+---
+
+### Q: What state management should I propose for a React Native news feed?
+
+**A:** The modern answer splits concerns cleanly:
+
+| State type | Tool | Why |
+|-----------|------|-----|
+| **Server state** (feed posts, user data) | **React Query** | Caching, deduplication, background refresh, pagination — all free |
+| **Global client state** (auth, theme, cart) | **Zustand** or **Jotai** | Tiny, zero-boilerplate, no provider hell |
+| **Local UI state** (modal open, input value) | React `useState` | No need to reach for a library |
+| **Forms** | **React Hook Form** | Controlled inputs without a re-render per keystroke |
+
+In an interview: *"I'd use React Query for server state because it eliminates the manual loading/error/data state dance, and Zustand for client state because it avoids Redux's ceremony while still keeping state outside components for sharing across screens."*
+
+**Why not Redux for a feed app?** It's not wrong — but it's overkill. You'd manually write actions, reducers, and selectors to manage data that React Query handles automatically. Redux shines when you have complex state with many concurrent writers and need time-travel debugging.
+
+---
+
+---
+
+### Q: How do you make a FlatList perform well with thousands of posts?
+
+**A:** `FlatList` is React Native's virtualized list — it only renders what's on screen. But there are several levers that separate a smooth feed from a janky one:
+
+```tsx
+<FlatList
+  data={posts}
+  keyExtractor={(item) => item.id}
+  renderItem={({ item }) => <PostCard post={item} />}
+
+  // Pagination — fires when user is 50% from the bottom
+  onEndReached={() => {
+    if (hasNextPage && !isFetchingNextPage) fetchNextPage();
+  }}
+  onEndReachedThreshold={0.5}
+
+  // Performance knobs
+  initialNumToRender={10}        // Only render visible items on first paint
+  maxToRenderPerBatch={5}        // How many items to add per batch as user scrolls
+  windowSize={7}                 // Render window: 3 screens above + 3 below current
+  removeClippedSubviews          // Detach off-screen views from native hierarchy
+  ListFooterComponent={isFetchingNextPage ? <ActivityIndicator /> : null}
+/>
+```
+
+**The `getItemLayout` trick (biggest win for fixed-height items):**
+
+```tsx
+const POST_HEIGHT = 120;
+
+<FlatList
+  {...props}
+  getItemLayout={(_, index) => ({
+    length: POST_HEIGHT,
+    offset: POST_HEIGHT * index,
+    index,
+  })}
+/>
+```
+
+Without `getItemLayout`, FlatList has to measure every item before it can scroll to a specific index — slow. With it, scroll-to-index is instant because the math is trivial. Mention this unprompted and it signals you've hit real performance walls.
+
+**Memoize your `renderItem` component:**
+
+```tsx
+// Without memo: re-renders every PostCard when ANY part of the feed state changes
+// With memo: only re-renders when that specific post's data changes
+const PostCard = React.memo(({ post }: { post: Post }) => {
+  return <View>...</View>;
+}, (prev, next) => prev.post.id === next.post.id && prev.post.likesCount === next.post.likesCount);
+```
 
 ---
 
@@ -177,6 +362,60 @@ Think of it like this:
 - WebSocket = Having an open phone line 📞
 
 Most real chat apps (WhatsApp, Slack, Discord) use exactly this hybrid.
+
+---
+
+### Q: How do I implement WebSocket in React Native?
+
+**A:** React Native ships with the browser-standard `WebSocket` API — no library needed. Wrap it in a service class with automatic reconnection:
+
+```typescript
+class ChatSocketService {
+  private socket: WebSocket | null = null;
+  private reconnectAttempts = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  connect(token: string) {
+    this.socket = new WebSocket(`wss://api.chat.com/v1/socket?token=${token}`);
+
+    this.socket.onopen = () => {
+      this.reconnectAttempts = 0; // Reset on successful connect
+    };
+
+    this.socket.onmessage = (event) => {
+      const data = JSON.parse(event.data as string);
+      this.handleEvent(data);
+    };
+
+    this.socket.onclose = () => {
+      this.scheduleReconnect(token);
+    };
+  }
+
+  private scheduleReconnect(token: string) {
+    // Exponential backoff: 1s, 2s, 4s, 8s... capped at 30s
+    const delay = Math.min(1000 * 2 ** this.reconnectAttempts, 30_000);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectAttempts++;
+      this.connect(token);
+    }, delay);
+  }
+
+  send(event: object) {
+    if (this.socket?.readyState === WebSocket.OPEN) {
+      this.socket.send(JSON.stringify(event));
+    }
+    // If socket isn't open, queue the message (see offline handling below)
+  }
+
+  disconnect() {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.socket?.close();
+  }
+}
+```
+
+**Key point to mention in your interview**: Mobile apps lose connectivity constantly — tunnels, elevators, switching networks. Without reconnection logic, a user who loses signal for 10 seconds has a broken chat. Exponential backoff prevents hammering the server when it's overwhelmed.
 
 ---
 

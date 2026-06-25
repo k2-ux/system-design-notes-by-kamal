@@ -90,6 +90,50 @@ UI update (one smooth update with all new prices)
 
 Buffered is the sweet spot for most trading apps.
 
+**Implementing buffered updates in React Native / JavaScript:**
+
+```typescript
+import { useRef, useCallback, useEffect } from 'react';
+
+function useBufferedPriceUpdates(
+  onFlush: (prices: Record<string, number>) => void,
+  intervalMs = 1000
+) {
+  const buffer = useRef<Record<string, number>>({});
+
+  useEffect(() => {
+    const timer = setInterval(() => {
+      if (Object.keys(buffer.current).length > 0) {
+        onFlush({ ...buffer.current });
+        buffer.current = {}; // Clear after flush
+      }
+    }, intervalMs);
+    return () => clearInterval(timer);
+  }, [onFlush, intervalMs]);
+
+  return useCallback((symbol: string, price: number) => {
+    buffer.current[symbol] = price; // Latest price overwrites — no duplicates
+  }, []);
+}
+
+// Usage
+const addPriceUpdate = useBufferedPriceUpdates((prices) => {
+  setPrices(prev => ({ ...prev, ...prices })); // Merge into state
+});
+
+socketService.onPriceUpdate = (symbol, price) => {
+  addPriceUpdate(symbol, price); // Cheap — just writes to a ref, no re-render
+};
+```
+
+Key insight worth mentioning: **throttle vs debounce**. For stock prices you want `throttle` (execute once every N ms, take latest value) not `debounce` (wait for silence). Debounce would never fire during a fast-moving market.
+
+```typescript
+// One-liner with lodash (mention this as an alternative)
+import throttle from 'lodash/throttle';
+const updatePrices = throttle((prices) => setPrices(prices), 1000);
+```
+
 ---
 
 ### Q: What about those fancy stock price charts?
@@ -115,6 +159,43 @@ Buffered is the sweet spot for most trading apps.
 | **WebView-based** (TradingView, D3.js) ✅ | Works on both platforms, rich features | WebView overhead, less "native" feel |
 
 Many real apps use **WebView-based** rendering because the same chart code works on iOS, Android, AND web. eToro does this with TradingView. Robinhood went native for maximum performance with their Spark library.
+
+**Charting libraries in React Native specifically:**
+
+| Library | Technology | Best for |
+|---------|-----------|---------|
+| **Victory Native XL** | React Native Skia (GPU-rendered) | Production trading apps — smooth real-time updates |
+| **react-native-gifted-charts** | SVG-based | Simple charts with a clean API, good for most use cases |
+| **TradingView widget (WebView)** | HTML/Canvas | Copying the industry-standard trading UI, works on all platforms |
+| **react-native-chart-kit** | SVG | Quick prototyping — performance issues at scale |
+
+For a trading app, **Victory Native XL** with React Native Skia is the right answer. Skia is the same rendering engine Flutter uses — it draws directly to the GPU, making real-time price chart updates smooth at 60fps without JS thread involvement:
+
+```tsx
+import { CartesianChart, Line } from 'victory-native';
+
+function StockChart({ data }: { data: PricePoint[] }) {
+  return (
+    <CartesianChart
+      data={data}
+      xKey="timestamp"
+      yKeys={["price"]}
+      domainPadding={{ top: 20 }}
+    >
+      {({ points }) => (
+        <Line
+          points={points.price}
+          color="#00C851"
+          strokeWidth={2}
+          animate={{ type: 'timing', duration: 300 }}
+        />
+      )}
+    </CartesianChart>
+  );
+}
+```
+
+Mention in interview: *"Since the chart updates every second, I'd use Victory Native XL which renders on the UI thread via Skia — the JS thread being busy with WebSocket messages won't cause chart jank."*
 
 The data flow for real-time charts:
 ```
@@ -261,6 +342,45 @@ This works even if:
 On Android: `SystemClock.elapsedRealtime()`
 On iOS: `ProcessInfo.processInfo.systemUptime`
 
+**In React Native — implement with server time offset:**
+
+```typescript
+function useReservationCountdown(serverExpiresAt: string, serverResponseTimestamp: number) {
+  // serverResponseTimestamp = Date.now() captured right when you received the API response
+  // This gives you the offset between your local clock and the "server's clock" as echoed back
+  const clockOffset = useRef(serverResponseTimestamp - Date.now());
+  const [secondsLeft, setSecondsLeft] = useState(0);
+
+  useEffect(() => {
+    const expiresMs = new Date(serverExpiresAt).getTime();
+
+    const interval = setInterval(() => {
+      const adjustedNow = Date.now() + clockOffset.current;
+      const remaining = Math.max(0, expiresMs - adjustedNow);
+      setSecondsLeft(Math.floor(remaining / 1000));
+      if (remaining <= 0) clearInterval(interval);
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [serverExpiresAt]);
+
+  const minutes = Math.floor(secondsLeft / 60);
+  const seconds = String(secondsLeft % 60).padStart(2, '0');
+  return `${minutes}:${seconds}`;
+}
+
+// Usage in your component
+function BookingTimer({ reservation }: { reservation: ReservationResponse }) {
+  const countdown = useReservationCountdown(
+    reservation.expiresAt,
+    reservation._receivedAt // Set this when you get the API response: Date.now()
+  );
+  return <Text style={styles.timer}>{countdown}</Text>;
+}
+```
+
+The `clockOffset` compensates for the user's device clock being wrong. If their phone is set 5 minutes into the future, a naive `Date.now()` countdown would expire 5 minutes early. The offset anchors the countdown to your server's time reference.
+
 ---
 
 ### Q: Autocomplete for hotel search — how does that work?
@@ -310,6 +430,46 @@ The payment flow:
 ```
 
 **Critical**: The backend does **authorization** first (reserves the money) and **capture** later (actually takes it). If the booking fails between those two steps, the money stays in the user's account.
+
+**Stripe React Native SDK — what the actual implementation looks like:**
+
+```tsx
+import { useStripe } from '@stripe/stripe-react-native';
+
+function PaymentScreen({ reservationId }: { reservationId: string }) {
+  const { initPaymentSheet, presentPaymentSheet } = useStripe();
+
+  async function handlePay() {
+    // 1. Backend creates a PaymentIntent and returns the clientSecret
+    const { clientSecret } = await api.createPaymentIntent(reservationId);
+
+    // 2. Initialize with Apple Pay / Google Pay enabled
+    await initPaymentSheet({
+      merchantDisplayName: 'HotelApp',
+      paymentIntentClientSecret: clientSecret,
+      applePay: { merchantCountryCode: 'US' },
+      googlePay: { merchantCountryCode: 'US', testEnv: __DEV__ },
+      defaultBillingDetails: { name: user.fullName },
+    });
+
+    // 3. Show the native Stripe payment UI
+    const { error } = await presentPaymentSheet();
+
+    if (!error) {
+      // 4. Backend confirms via Stripe webhook — no extra API call from client
+      navigation.navigate('BookingConfirmed', { reservationId });
+    } else if (error.code !== 'Canceled') {
+      showToast('Payment failed: ' + error.message);
+    }
+  }
+
+  return <Button onPress={handlePay} title="Confirm & Pay" />;
+}
+```
+
+`presentPaymentSheet()` renders a native UI that handles Apple Pay / Google Pay (with Face ID / Touch ID), saved cards, and new card entry. Your app never touches raw card numbers — Stripe tokenizes everything on-device.
+
+Mention in your interview: *"The client gets a clientSecret from our backend, not card data. Our backend calls Stripe to verify and capture. Even if someone intercepted the clientSecret, they can only charge this one transaction — not reuse it."*
 
 ---
 

@@ -296,6 +296,262 @@ This shows **depth AND breadth**. You nailed the 45-minute problem AND you know 
 
 ---
 
+## ⚛️ REACT NATIVE SPECIFICS
+
+---
+
+### Q: What does the state management landscape look like in React Native?
+
+**A:** The modern answer layers three separate concerns — don't mix them:
+
+| State type | Tool | Why |
+|-----------|------|-----|
+| **Server state** (API data, lists, user profiles) | **React Query (TanStack Query)** | Caching, deduplication, background refresh, optimistic updates — all built-in |
+| **Global client state** (auth, theme, cart, modals) | **Zustand** or **Jotai** | Zero-boilerplate, no provider nesting, works outside React components |
+| **Local UI state** (form inputs, toggles, animations) | React `useState` / `useReducer` | No need to reach for a library |
+| **Navigation state** | **React Navigation** | The de facto standard. Stack, Tab, Drawer navigators |
+| **Form state** | **React Hook Form** | Controlled inputs without re-rendering on every keystroke |
+
+**The Zustand pitch:**
+
+```typescript
+import { create } from 'zustand';
+import { persist, createJSONStorage } from 'zustand/middleware';
+import { MMKV } from 'react-native-mmkv';
+
+const storage = new MMKV();
+
+// Auth store — persists across app restarts
+export const useAuthStore = create(
+  persist(
+    (set) => ({
+      user: null as User | null,
+      token: null as string | null,
+      login: (user: User, token: string) => set({ user, token }),
+      logout: () => set({ user: null, token: null }),
+    }),
+    {
+      name: 'auth-storage',
+      storage: createJSONStorage(() => ({
+        getItem: (key) => storage.getString(key) ?? null,
+        setItem: (key, value) => storage.set(key, value),
+        removeItem: (key) => storage.delete(key),
+      })),
+    }
+  )
+);
+```
+
+**Why not Redux for most React Native apps?** It's not wrong — but it adds actions, reducers, selectors, and middleware for problems that React Query + Zustand solve in a fraction of the code. Redux shines in very complex apps with many concurrent writers who need strict state transition guarantees and time-travel debugging.
+
+---
+
+### Q: What are the storage options in React Native and when do I use each?
+
+**A:**
+
+| Need | Library | Notes |
+|------|---------|-------|
+| Key-value, fast synchronous reads | **MMKV** | 10× faster than AsyncStorage, C++ backed, synchronous |
+| Key-value, async (legacy) | **AsyncStorage** | Still fine for non-critical, infrequent reads |
+| Large relational datasets (10k+ rows) | **WatermelonDB** | Reactive, SQLite-backed, built for offline-first |
+| Medium relational data | **react-native-sqlite-storage + Drizzle ORM** | Direct SQLite with type-safe queries |
+| Persisted server state cache | **React Query + MMKV persister** | Instant first load from cache, refresh in background |
+| Binary files (videos, PDFs) | **react-native-fs** | App sandbox file reads/writes |
+| Secrets, tokens, encryption keys | **react-native-keychain** | iOS Keychain / Android Keystore — hardware-backed, biometric unlock |
+
+**Why MMKV over AsyncStorage:**
+
+```typescript
+// AsyncStorage — async, needs await everywhere
+const token = await AsyncStorage.getItem('token'); // Can't call this at module level
+
+// MMKV — synchronous, call anywhere
+const storage = new MMKV();
+const token = storage.getString('token'); // Works at module init, in middleware, anywhere
+```
+
+The synchronous read matters at app boot — you need the auth token *immediately* to decide whether to show the login screen or the home screen. With AsyncStorage, you'd always see a brief flash of the wrong screen.
+
+**WatermelonDB for chat history:**
+
+WatermelonDB was built for apps with large local datasets. It adds a reactive layer on top of SQLite so your message list only re-renders when *those specific messages* change:
+
+```typescript
+// Only re-renders when messages in this conversation change
+const messages = useQuery(
+  Message.query(Q.where('conversation_id', conversationId))
+);
+```
+
+---
+
+### Q: What is OTA (Over-the-Air) updates and why does every React Native developer mention it?
+
+**A:** One of React Native's killer features: because your app logic is JavaScript, you can ship bug fixes and new features **without going through App Store / Play Store review** (which takes 1–3 days).
+
+**CodePush** (Microsoft App Center) is the standard for React Native CLI projects — `code-push release-react MyApp ios` to publish a new bundle.
+
+**How it works:**
+
+1. You run `code-push release-react MyApp ios --target-binary-version "~1.2.0"`
+2. Users open the app → CodePush checks for updates in the background
+3. New JS bundle downloads silently
+4. On next cold start (or immediately if you configure `InstallMode.IMMEDIATE`), the new bundle loads
+
+**The critical limitations to mention in interviews** (shows you've actually shipped this):
+- You can only update **JavaScript and assets** — native code changes (adding a new library with native modules) require a full App Store release
+- Apple's review guidelines: updates must be "consistent with the app's intended purpose" — no major behavior changes via OTA
+- Classic use case: *"We shipped a crash fix at 11pm to 100% of users without waiting 3 days for App Store approval"*
+
+```typescript
+import codePush, { CodePushOptions } from 'react-native-code-push';
+import { AppState, AppStateStatus } from 'react-native';
+
+const codePushOptions: CodePushOptions = {
+  checkFrequency: codePush.CheckFrequency.ON_APP_RESUME,
+  installMode: codePush.InstallMode.ON_NEXT_RESTART,   // Don't interrupt the user mid-session
+  mandatoryInstallMode: codePush.InstallMode.IMMEDIATE, // Critical patches install now
+};
+
+// Wrap your root component
+export default codePush(codePushOptions)(App);
+```
+
+CodePush also supports **staged rollouts** — release to 10% of users first, monitor crash rates, then promote to 100%. Same concept as feature flags but for JS bundles.
+
+---
+
+### Q: What are the React Native performance fundamentals I should know for an interview?
+
+**A:** The core mental model: React Native runs in **two threads**. Performance problems usually come from one blocking the other.
+
+**JS Thread** — React reconciliation, state updates, business logic
+- Blocked by: heavy `JSON.parse`, complex renders, synchronous loops
+- Fix: memoize with `useMemo`/`React.memo`, move computation off-thread
+
+**UI Thread (Main Thread)** — native rendering, gestures, animations
+- Blocked by: synchronous JS calls via the Bridge
+- Fix: use **React Native Reanimated** (animations run entirely on UI thread via worklets)
+
+**The Bridge / New Architecture:**
+- Old Architecture: JS ↔ Native calls are serialized to JSON and sent async over a bridge — expensive for high-frequency calls
+- New Architecture (JSI): native calls become direct C++ function pointers — synchronous and near-zero overhead
+
+**Five things to say that show performance maturity:**
+
+1. **"I'd use React Native Reanimated for animations"** — worklets run on the UI thread, so dragging a card stays smooth even when the JS thread is busy parsing API responses
+2. **"I'd memoize `renderItem` with `React.memo`"** — prevents re-rendering every list item when parent state changes
+3. **"I'd add `getItemLayout` to FlatList"** — lets FlatList skip layout measurement, making `scrollToIndex` instant
+4. **"I'd use `InteractionManager.runAfterInteractions`"** — defer expensive setup until navigation transitions finish, so screens appear instantly
+5. **"I'd enable Hermes"** — Google's JS engine optimized for RN: faster startup, lower memory, TTI (time-to-interactive) improvements
+
+```typescript
+import { InteractionManager } from 'react-native';
+import { useEffect, useState } from 'react';
+
+function HeavyScreen() {
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    // Don't run expensive setup until the screen's transition animation finishes
+    const handle = InteractionManager.runAfterInteractions(() => {
+      loadHeavyData();
+      setReady(true);
+    });
+    return () => handle.cancel();
+  }, []);
+
+  if (!ready) return <LoadingPlaceholder />;
+  return <TheActualScreen />;
+}
+```
+
+---
+
+### Q: What navigation pattern should I propose in a React Native interview?
+
+**A:** **React Navigation** is the answer. It's the de facto standard and what interviewers expect.
+
+```tsx
+// Typical production app shell
+export function AppNavigator() {
+  const { user } = useAuthStore();
+
+  return (
+    <NavigationContainer>
+      {user ? <MainNavigator /> : <AuthNavigator />}
+    </NavigationContainer>
+  );
+}
+
+function AuthNavigator() {
+  return (
+    <Stack.Navigator screenOptions={{ headerShown: false }}>
+      <Stack.Screen name="Login" component={LoginScreen} />
+      <Stack.Screen name="Register" component={RegisterScreen} />
+    </Stack.Navigator>
+  );
+}
+
+function MainNavigator() {
+  return (
+    <Tab.Navigator>
+      <Tab.Screen name="Feed" component={FeedStack} />
+      <Tab.Screen name="Search" component={SearchScreen} />
+      <Tab.Screen name="Profile" component={ProfileScreen} />
+    </Tab.Navigator>
+  );
+}
+```
+
+**Performance tip to mention:** Use `@react-navigation/native-stack` (not the JS stack) — it uses actual native `UINavigationController` (iOS) and `Fragment` transitions (Android), which run on the UI thread and feel identical to native apps.
+
+React Navigation is the answer for RN CLI projects — it's what interviewers expect and what most production codebases use.
+
+---
+
+### Q: How do I think about testing in React Native?
+
+**A:** Three levels, each with a clear purpose:
+
+| Level | Tool | Tests |
+|-------|------|-------|
+| **Unit** | **Jest** | Custom hooks, utility functions, data transformers |
+| **Component** | **React Native Testing Library (RNTL)** | Component rendering, user interactions, state changes |
+| **E2E** | **Detox** or **Maestro** | Full user flows on a real device/simulator |
+
+```typescript
+// RNTL — test user interactions, not implementation
+import { render, screen, fireEvent, waitFor } from '@testing-library/react-native';
+
+test('like button updates count optimistically', async () => {
+  // Arrange: render with mocked React Query
+  const wrapper = createQueryClientWrapper();
+  render(<PostCard post={mockPost} />, { wrapper });
+
+  // Act: user taps the like button
+  fireEvent.press(screen.getByTestId('like-button'));
+
+  // Assert: count increments immediately (optimistic)
+  expect(screen.getByTestId('like-count')).toHaveTextContent('43');
+
+  // Assert: API was called
+  await waitFor(() => {
+    expect(mockApi.likePost).toHaveBeenCalledWith(mockPost.id);
+  });
+});
+```
+
+**The testing pyramid for React Native:**
+- **Many unit tests** (fast, cheap, test business logic in custom hooks)
+- **Some component tests** (test that components render correctly and respond to interaction)
+- **Few E2E tests** (slow, expensive, brittle — only for the most critical paths: login, checkout, onboarding)
+
+**Detox pitfall to mention:** E2E tests flake on timing. Use `waitFor` with explicit conditions rather than `sleep` calls.
+
+---
+
 ## 🎯 FINAL RAPID-FIRE: 10 Things to Always Mention
 
 1. **"I'll use cursor-based pagination because..."** → Shows you know the tradeoffs
@@ -308,6 +564,19 @@ This shows **depth AND breadth**. You nailed the 45-minute problem AND you know 
 8. **"In-memory cache first, then disk, then network"** → Shows performance thinking
 9. **"I'd track this with analytics to measure impact"** → Shows data-driven mindset
 10. **"Let me present the tradeoffs..."** → The single most important habit
+
+---
+
+## ⚛️ REACT NATIVE RAPID-FIRE: 8 Things That Signal Senior RN Experience
+
+1. **"I'd use React Query for server state — it eliminates manual loading/error state and gives me caching for free"** → Shows you're current
+2. **"MMKV instead of AsyncStorage — synchronous reads matter at app boot"** → Shows performance awareness
+3. **"I'd use Reanimated for this animation — worklets run on the UI thread so they won't drop frames when the JS thread is busy"** → Shows threading knowledge
+4. **"I'd add `getItemLayout` to the FlatList since items have a fixed height"** → Shows you've hit real scroll performance walls
+5. **"We can ship critical bug fixes same-day with CodePush — no App Store wait"** → Shows production shipping experience
+6. **"I'd use `InteractionManager.runAfterInteractions` for the heavy setup so the screen transition animation stays smooth"** → Shows startup performance care
+7. **"TypeScript interfaces for the API contracts, validated at runtime with Zod"** → Shows you've been burned by unexpected API shapes
+8. **"I'd split this into feature modules — `:feed`, `:chat`, `:core-network` — for parallel builds and team ownership"** → Shows large-team experience
 
 ---
 

@@ -98,6 +98,67 @@ Response: { chunksProcessed: 298, totalChunks: 410 }
 | **Background uploads** | Use WorkManager (Android) / BGTasks (iOS) to continue uploading when app isn't visible |
 | **Network changes** | Pause on cellular (if user prefers), resume on Wi-Fi |
 
+**Background uploads in React Native:**
+
+For simple one-shot uploads (small files), use `fetch` directly with a `FormData` or `Blob`:
+
+```typescript
+import RNFS from 'react-native-fs';
+
+async function uploadChunk(
+  uploadId: string,
+  filePath: string,
+  byteStart: number,
+  byteEnd: number,
+  totalSize: number
+) {
+  // Read the specific byte range from disk
+  const chunk = await RNFS.read(filePath, byteEnd - byteStart, byteStart, 'base64');
+
+  return fetch(`https://api.example.com/v1/upload/${uploadId}/chunk`, {
+    method: 'PUT',
+    headers: {
+      'Content-Range': `bytes ${byteStart}-${byteEnd - 1}/${totalSize}`,
+      'Content-Type': 'application/octet-stream',
+      'Authorization': `Bearer ${token}`,
+    },
+    body: Uint8Array.from(atob(chunk), c => c.charCodeAt(0)), // base64 → binary
+  });
+}
+```
+
+For true background uploads that survive app termination, use **`react-native-background-upload`** — it wraps NSURLSession (iOS) and OkHttp (Android), both of which continue transfers even when the OS suspends your app:
+
+```typescript
+import Upload from 'react-native-background-upload';
+import { AppState } from 'react-native';
+
+const uploadId = await Upload.startUpload({
+  url: `https://api.example.com/v1/upload/${resumableUploadId}`,
+  path: localFilePath,   // file:// URI
+  method: 'PUT',
+  type: 'raw',
+  headers: { 'Authorization': `Bearer ${token}` },
+  notification: {
+    enabled: true,
+    notificationChannel: 'file-uploads',
+    onProgressTitle: 'Uploading...',
+    onCompleteTitle: 'Upload complete',
+  },
+});
+
+// Progress events fire even when app is backgrounded
+Upload.addListener('progress', uploadId, ({ progress }) => {
+  setUploadProgress(progress / 100);
+});
+
+Upload.addListener('error', uploadId, ({ error }) => {
+  scheduleRetry(resumableUploadId); // Resume from where we left off
+});
+```
+
+In your interview: *"On iOS, NSURLSession download/upload tasks are managed by the OS — they continue in the background even if the app is killed. When the app relaunches, we query `GET /upload/{id}` to find how many chunks were processed and resume from there."*
+
 ---
 
 ### Q: What about file versioning and conflicts?
@@ -182,6 +243,67 @@ This is called **Adaptive Bitrate Streaming (ABR)** and it's powered by protocol
 
 For Android: use **ExoPlayer** (now Media3). For iOS: use **AVPlayer**. These handle all the ABR magic natively.
 
+**Video playback in React Native — `react-native-video`:**
+
+```tsx
+import Video from 'react-native-video';
+import { useState } from 'react';
+
+function VideoPlayer({ hlsUrl }: { hlsUrl: string }) {
+  const [paused, setPaused] = useState(false);
+  const [buffering, setBuffering] = useState(false);
+
+  return (
+    <>
+      <Video
+        source={{ uri: hlsUrl }}        // Works with .m3u8 (HLS) and .mpd (DASH) URLs
+        style={styles.video}
+        resizeMode="contain"
+        paused={paused}
+        controls                         // Native player controls (scrubber, play/pause)
+        allowsExternalPlayback           // AirPlay (iOS) / ChromeCast (Android)
+        pictureInPicture                 // PiP support
+        onBuffer={({ isBuffering }) => setBuffering(isBuffering)}
+        onError={(error) => console.error('Playback error:', error)}
+        onBandwidthUpdate={({ bitrate }) => {
+          // Called when ABR changes quality — log for analytics
+        }}
+      />
+      {buffering && <ActivityIndicator style={styles.bufferSpinner} />}
+    </>
+  );
+}
+```
+
+For a YouTube-like deep dive, mention:
+- **HLS manifest** (`playlist.m3u8`) is fetched first — it lists all quality renditions (360p, 720p, 1080p)
+- The player auto-selects quality based on available bandwidth (this is ABR happening transparently)
+- On iOS, `AVPlayer` handles HLS natively; on Android, ExoPlayer takes over — both are wrapped by `react-native-video`
+- `onBandwidthUpdate` fires whenever ABR switches quality — wire it to analytics to understand how often users degrade
+
+**Background audio playback in React Native:**
+
+```typescript
+import TrackPlayer, { Capability } from 'react-native-track-player';
+
+// Setup runs once at app startup
+async function setupPlayer() {
+  await TrackPlayer.setupPlayer();
+  await TrackPlayer.updateOptions({
+    capabilities: [Capability.Play, Capability.Pause, Capability.Stop],
+    compactCapabilities: [Capability.Play, Capability.Pause],
+    notificationCapabilities: [Capability.Play, Capability.Pause],
+  });
+}
+
+// When user minimizes the YouTube-like app
+async function switchToAudioOnly(audioStreamUrl: string) {
+  await TrackPlayer.add({ url: audioStreamUrl, title: video.title, artist: video.channelName });
+  await TrackPlayer.play();
+  // Now shows in system audio controls + lock screen
+}
+```
+
 ---
 
 ### Q: How do subtitles and audio tracks work?
@@ -259,6 +381,72 @@ Both platforms may delay or batch your background work — your code needs to ha
 ---
 
 ## 📚 PART 3: PAGINATION LIBRARY
+
+---
+
+### Q: How do you implement pagination in React Native — what does the actual code look like?
+
+**A:** In React Native, `FlatList` + React Query's `useInfiniteQuery` is the standard pattern:
+
+```tsx
+interface FeedPage {
+  posts: Post[];
+  nextCursor: string | null;
+}
+
+function FeedScreen() {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+    isLoading,
+    isError,
+  } = useInfiniteQuery<FeedPage>({
+    queryKey: ['feed'],
+    queryFn: ({ pageParam }) =>
+      api.getFeed({ cursor: pageParam as string | undefined, limit: 20 }),
+    getNextPageParam: (lastPage) => lastPage.nextCursor,  // null = no more pages
+    initialPageParam: undefined,
+    staleTime: 1000 * 60 * 2,  // Consider data fresh for 2 minutes
+  });
+
+  // Flatten pages into a single array
+  const posts = data?.pages.flatMap((page) => page.posts) ?? [];
+
+  if (isLoading) return <LoadingSkeleton />;
+  if (isError) return <ErrorView onRetry={() => refetch()} />;
+
+  return (
+    <FlatList
+      data={posts}
+      keyExtractor={(item) => item.id}
+      renderItem={({ item }) => <PostCard post={item} />}
+      onEndReached={() => {
+        if (hasNextPage && !isFetchingNextPage) fetchNextPage();
+      }}
+      onEndReachedThreshold={0.5}
+      ListFooterComponent={
+        isFetchingNextPage
+          ? <ActivityIndicator style={{ marginVertical: 16 }} />
+          : null
+      }
+      refreshControl={
+        <RefreshControl
+          refreshing={isRefetching && !isFetchingNextPage}
+          onRefresh={() => refetch()}
+        />
+      }
+    />
+  );
+}
+```
+
+The key things to walk through in an interview:
+1. `getNextPageParam` extracts the cursor from each response — return `undefined` or `null` to signal "no more pages"
+2. `pages.flatMap()` stitches all loaded pages into one flat list for `FlatList`
+3. `onEndReachedThreshold={0.5}` triggers the next page load when the user is 50% of the remaining scroll distance from the bottom — gives time to load before they hit the edge
+4. The `RefreshControl` wires pull-to-refresh to re-fetch from page 1
 
 ---
 

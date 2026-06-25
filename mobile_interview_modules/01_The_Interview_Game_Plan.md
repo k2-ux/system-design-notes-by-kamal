@@ -66,6 +66,29 @@ Then organize what you learn into two buckets:
 
 ---
 
+### Q: In React Native, how do I actually make network requests — Fetch, Axios, or React Query?
+
+**A:** They solve different problems and you'll often use all three layers together:
+
+| Layer | Tool | Does what |
+|-------|------|-----------|
+| **HTTP client** | `fetch` (built-in) or `axios` | Makes the raw HTTP request. Axios adds interceptors and timeout support. |
+| **Server state manager** | **React Query (TanStack Query)** | Caches responses, deduplicates requests, handles background refresh, loading/error states |
+| **WebSocket** | Built-in `WebSocket` API | RN ships with the same WebSocket API as browsers — no library needed |
+
+In an interview, the answer that stands out:
+
+*"I'd use React Query as my server state layer. It sits on top of fetch/axios and gives me automatic caching, background refetching when the app comes to foreground, and deduplication — so if two components both need the same user profile, only one request goes out. For real-time, I'd pair it with WebSocket and invalidate or update the React Query cache when events arrive."*
+
+This is the pattern modern RN teams use in production. Mentioning React Query by name shows you're current.
+
+**What about `Axios` vs `fetch`?**
+- `fetch` is built-in, no bundle cost. Fine for most apps.
+- `axios` shines when you need request/response interceptors (e.g., attaching auth tokens to every request, refreshing expired JWTs transparently).
+- Either one can be used as React Query's `queryFn`.
+
+---
+
 ### Q: What does a good API design actually look like in an interview?
 
 **A:** Keep it simple and RESTful. You're not writing production docs — you're showing you understand the pattern:
@@ -94,6 +117,66 @@ Post {
 *"I'll use cursor-based pagination here because the feed is constantly changing — offset-based would cause items to shift between pages."*
 
 Interviewer: 😍
+
+---
+
+### Q: I'm a React Native developer — how do I write data models in an interview?
+
+**A:** Use **TypeScript interfaces**. They're clean, expressive, and every mobile interviewer recognizes them:
+
+```typescript
+interface Post {
+  id: string;
+  authorId: string;
+  content: string;
+  imageUrl?: string;        // ? = optional field
+  createdAt: string;        // ISO 8601 timestamp from the API
+  likesCount: number;
+  isLikedByMe: boolean;     // server-computed field, saves a client-side lookup
+}
+
+interface PaginatedResponse<T> {
+  items: T[];
+  nextCursor: string | null; // null = you've reached the end
+}
+```
+
+One thing worth mentioning: TypeScript interfaces only enforce types at compile time — there's no runtime guarantee that the API actually returns what you expect. In a production RN app, you'd validate responses with **Zod**:
+
+```typescript
+const PostSchema = z.object({
+  id: z.string(),
+  authorId: z.string(),
+  content: z.string(),
+  imageUrl: z.string().optional(),
+  createdAt: z.string(),
+  likesCount: z.number(),
+  isLikedByMe: z.boolean(),
+});
+
+type Post = z.infer<typeof PostSchema>; // Type is derived from the schema — one source of truth
+```
+
+This is particularly valuable when your backend team changes a field name without telling anyone. Zod catches it at the boundary instead of letting a `undefined` crash bubble up to the UI.
+
+---
+
+### Q: How does React Native's architecture affect my interview answers?
+
+**A:** React Native runs in **two threads** — you need to understand this to give senior-level answers:
+
+| Thread | Runs | Can be blocked by |
+|--------|------|-------------------|
+| **JS Thread** | Your React components, state, business logic | Heavy JSON parsing, complex renders, synchronous computation |
+| **UI Thread (Main)** | Native rendering, gestures, animations | Synchronous JS calls crossing the bridge |
+
+This split has real design implications you can drop into answers:
+
+- **Animations**: Say *"I'd use React Native Reanimated with worklets so animations run on the UI thread — they stay smooth even when the JS thread is busy fetching data."*
+- **Heavy data**: *"Parsing a 500-item feed response on the JS thread can cause frame drops. I'd use a streaming JSON parser or process the response in a background worker."*
+- **State updates**: React reconciliation happens on the JS thread — keep renders cheap. Memoize expensive components with `React.memo`.
+
+The **New Architecture** (Fabric + JSI + TurboModules) largely eliminates the serialization overhead of the bridge, making native calls direct function pointers. Mention it casually: *"With the New Architecture enabled, synchronous native module calls become possible — useful for things like reading from the local database without async overhead."*
 
 ---
 
