@@ -737,6 +737,276 @@
 
 ---
 
+---
+
+## 19. Coordination & Service Discovery
+
+> These tools solve one problem: in a distributed system with dozens of services and hundreds of servers, how does Service A know where Service B is, and how do they agree on shared configuration?
+
+---
+
+### Apache ZooKeeper
+
+**Hardware POV:**
+> Runs on a small cluster of odd-numbered servers (3 or 5 nodes — must be odd for majority voting). Very lightweight — each node needs only 1–2 GB RAM and minimal CPU. Not storage-intensive. Network latency between nodes matters most: ZooKeeper nodes should be in the same datacenter.
+
+**Software POV:**
+> A distributed coordination service. Stores tiny pieces of data (like config values or leader election results) in a tree structure, and guarantees that all nodes in a cluster see the same value at the same time — even during failures.
+> ```
+> ZooKeeper data tree (like a filesystem):
+>   /kafka/brokers/ids/1  → "broker1.internal:9092"
+>   /kafka/brokers/ids/2  → "broker2.internal:9092"
+>   /kafka/controller     → "1"  (which broker is the leader)
+>   /election/leader      → "node_A"
+>
+> If broker 1 dies:
+>   → ZooKeeper detects it (node disappears)
+>   → Triggers leader re-election automatically
+>   → Other brokers read new leader from ZooKeeper
+> ```
+> **Kafka used ZooKeeper** for broker coordination for years (now being replaced by KRaft). **HBase uses it** for region server coordination.
+
+**The key insight:**
+> ZooKeeper solves the "who's in charge?" problem in distributed systems. Without it, if a master node dies, other nodes don't know whether to elect a new master or wait — leading to split-brain. ZooKeeper provides a neutral, strongly-consistent third party everyone trusts.
+
+**Competitors:**
+> | Tool | Difference |
+> |------|-----------|
+> | **etcd** | Simpler, faster, written in Go. Used by Kubernetes to store all cluster state. The modern alternative to ZooKeeper. |
+> | **Consul** | Service discovery + health checking + key-value store in one. More feature-rich for microservices. |
+> | **Apache Curator** | Not a replacement — a client library that makes ZooKeeper easier to use. |
+
+---
+
+### etcd
+
+**Hardware POV:**
+> Same requirements as ZooKeeper — 3 or 5 nodes, low RAM, same datacenter. Uses Raft consensus algorithm (needs majority of nodes alive to function: 3-node cluster tolerates 1 failure, 5-node tolerates 2).
+
+**Software POV:**
+> Distributed key-value store with strong consistency. Every write is replicated to majority of nodes before acknowledging success. Kubernetes stores **everything** in etcd — every pod, service, config, and deployment definition.
+> ```
+> etcd stores Kubernetes state:
+>   /registry/pods/default/my-app-pod    → pod spec JSON
+>   /registry/services/default/my-svc    → service spec JSON
+>   /registry/deployments/default/my-dep → deployment spec JSON
+>
+> kubectl apply -f deployment.yaml
+>   → API server writes to etcd
+>   → All Kubernetes components watch etcd for changes
+>   → Scheduler sees new deployment → assigns pods to nodes
+> ```
+
+**Used for:** Kubernetes cluster state (mandatory), distributed locks, leader election, shared configuration across microservices.
+
+---
+
+### Consul (HashiCorp)
+
+**Hardware POV:**
+> Runs as an agent on EVERY server in your infrastructure (lightweight — ~50 MB RAM per agent). Agents gossip with each other to share health status. A small cluster of "server" agents (3–5) stores the authoritative state.
+
+**Software POV:**
+> Three things in one: **service discovery** + **health checking** + **key-value store**.
+> ```
+> Service Registration:
+>   Payment Service starts → registers itself with Consul:
+>   { name: "payment-service", address: "10.0.1.5", port: 8080, tags: ["v2"] }
+>
+> Service Discovery:
+>   Order Service asks Consul: "where is payment-service?"
+>   → Consul returns: "10.0.1.5:8080" (only healthy instances)
+>
+> Health Check:
+>   Consul pings /health on payment-service every 10s
+>   If it fails → removes from service registry automatically
+>   Order Service never gets the dead instance's address
+>
+> Without Consul: hardcode IPs in config files → nightmare when servers restart
+> With Consul: services find each other dynamically, dead ones auto-removed
+> ```
+
+**Used for:** Microservice architectures where services need to find each other at runtime. Very common with HashiCorp stack (Terraform + Vault + Consul).
+
+---
+
+## 20. DevOps & Infrastructure Tools
+
+---
+
+### Terraform (HashiCorp)
+
+**Hardware POV:**
+> Runs on your laptop or a CI/CD server. No hardware of its own — it just makes API calls to cloud providers (AWS, GCP, Azure) to provision hardware on your behalf.
+
+**Software POV:**
+> Infrastructure as Code (IaC). Define your entire cloud infrastructure in `.tf` files, run `terraform apply`, and it creates everything — servers, databases, load balancers, DNS records, VPCs — automatically.
+> ```hcl
+> # main.tf — define infrastructure as code
+> resource "aws_instance" "api_server" {
+>   ami           = "ami-0abcdef1234567890"
+>   instance_type = "t3.medium"
+>   count         = 3  # create 3 identical servers
+>
+>   tags = { Name = "api-server" }
+> }
+>
+> resource "aws_db_instance" "postgres" {
+>   engine         = "postgres"
+>   instance_class = "db.t3.micro"
+>   allocated_storage = 20
+> }
+>
+> terraform plan   → shows what will be created/changed/deleted (dry run)
+> terraform apply  → actually creates everything
+> terraform destroy → deletes everything (careful!)
+> ```
+> Terraform tracks state — if you change the config and re-run, it only modifies what changed. If someone manually changes infrastructure on AWS, Terraform detects the drift.
+
+**Used for:** Provisioning cloud infrastructure at scale. "I need 50 servers in 3 regions" → write once, apply everywhere.
+
+**Competitors:**
+> | Tool | Difference |
+> |------|-----------|
+> | **AWS CloudFormation** | AWS-only IaC. YAML/JSON format. Deeply integrated with AWS. |
+> | **Pulumi** | Infrastructure as Code but using real programming languages (TypeScript, Python) instead of HCL. |
+> | **Ansible** | Better for configuring existing servers (installing software, editing files). Not as strong for provisioning. |
+
+---
+
+### Ansible
+
+**Hardware POV:**
+> Agentless — runs on your laptop or CI server, SSHes into target servers, runs commands. No software installed on target servers. Can manage thousands of servers simultaneously.
+
+**Software POV:**
+> Configuration management and automation tool. You write **playbooks** (YAML files) describing what state each server should be in — what packages to install, what files to create, what services to start.
+> ```yaml
+> # playbook.yml
+> - hosts: api_servers        # target all servers tagged "api_servers"
+>   tasks:
+>     - name: Install Node.js
+>       apt: name=nodejs state=present
+>
+>     - name: Copy app config
+>       copy: src=./config.env dest=/app/.env
+>
+>     - name: Start app service
+>       systemd: name=myapp state=started enabled=yes
+>
+> ansible-playbook playbook.yml  → runs on all api_servers simultaneously
+> ```
+> Run it 10 times → same result. Idempotent — if Node.js is already installed, it skips that step.
+
+**Used for:** Configuring servers after Terraform creates them. Deploying application updates. Running the same command on 1000 servers at once.
+
+---
+
+### Jenkins
+
+**Hardware POV:**
+> Runs on a dedicated server (the "Jenkins master"). Builds run on "agents" — separate servers or Docker containers. A busy Jenkins setup might have 1 master + 20 agent servers running in parallel.
+
+**Software POV:**
+> CI/CD (Continuous Integration / Continuous Deployment) server. Automates: run tests → build Docker image → push to registry → deploy to Kubernetes — every time you push code.
+> ```groovy
+> // Jenkinsfile — defines the pipeline as code
+> pipeline {
+>   stages {
+>     stage('Test') {
+>       steps { sh 'npm test' }
+>     }
+>     stage('Build') {
+>       steps { sh 'docker build -t myapp:${BUILD_NUMBER} .' }
+>     }
+>     stage('Push') {
+>       steps { sh 'docker push myapp:${BUILD_NUMBER}' }
+>     }
+>     stage('Deploy') {
+>       steps { sh 'kubectl set image deployment/myapp myapp=myapp:${BUILD_NUMBER}' }
+>     }
+>   }
+> }
+> ```
+> Developer pushes code → Jenkins runs this automatically → if all passes, code is live.
+
+**Competitors:**
+> | Tool | Difference |
+> |------|-----------|
+> | **GitHub Actions** | CI/CD built into GitHub. YAML config. No server to manage. Most popular for open-source and startups. |
+> | **GitLab CI** | Built into GitLab. Strong for self-hosted git + CI in one. |
+> | **CircleCI** | Managed CI/CD. Fast, simple config. Popular with startups. |
+> | **AWS CodePipeline** | AWS-native CI/CD. Deep integration with other AWS services. |
+
+---
+
+### GitHub Actions
+
+**Hardware POV:**
+> Fully managed by GitHub — runs on GitHub's servers (or your own self-hosted runners). You pay per compute minute used. No servers to manage.
+
+**Software POV:**
+> CI/CD workflows defined as YAML files inside your repo (`.github/workflows/`). Triggers on push, PR, schedule, or manual.
+> ```yaml
+> # .github/workflows/deploy.yml
+> name: Deploy to Production
+> on:
+>   push:
+>     branches: [main]   # triggers on every push to main
+>
+> jobs:
+>   test-and-deploy:
+>     runs-on: ubuntu-latest
+>     steps:
+>       - uses: actions/checkout@v3
+>
+>       - name: Install dependencies
+>         run: npm install
+>
+>       - name: Run tests
+>         run: npm test
+>
+>       - name: Build Docker image
+>         run: docker build -t myapp:${{ github.sha }} .
+>
+>       - name: Push to ECR
+>         run: docker push myapp:${{ github.sha }}
+>
+>       - name: Deploy to Kubernetes
+>         run: kubectl set image deployment/myapp myapp=myapp:${{ github.sha }}
+> ```
+> Push to main → GitHub runs this → if tests pass → deployed in minutes.
+
+**Why it replaced Jenkins for most companies:** No server to maintain, config lives in the repo itself, massive marketplace of pre-built actions, free for public repos.
+
+---
+
+### HashiCorp Vault
+
+**Hardware POV:**
+> Runs on a small cluster of servers (3–5 nodes for HA). Very sensitive — should run on dedicated, hardened servers. Can use HSMs (Hardware Security Modules — dedicated encryption chips) for the highest security tier. Cloud: AWS KMS or Azure Key Vault act as the encryption backend.
+
+**Software POV:**
+> Secrets management — store and control access to passwords, API keys, database credentials, TLS certificates. Instead of putting `DB_PASSWORD=xyz` in a `.env` file, services ask Vault for credentials at runtime.
+> ```
+> Without Vault:
+>   DB_PASSWORD=supersecret in .env file
+>   → checked into git accidentally → everyone knows the password
+>   → can't rotate without redeploying every service
+>
+> With Vault:
+>   Service starts → authenticates with Vault (using its Kubernetes identity)
+>   → Vault returns a temporary DB password valid for 1 hour
+>   → Password auto-rotates → if leaked, expires quickly
+>   → No secret ever lives in a config file
+> ```
+
+**Used for:** Any company handling sensitive credentials at scale. Mandatory for SOC2/PCI-DSS compliance.
+
+**Competitors:** AWS Secrets Manager, GCP Secret Manager, Azure Key Vault (cloud-native alternatives — simpler but less portable).
+
+---
+
 ## Quick Comparison Table
 
 | Category | Most Used | When to Use Alternative |
@@ -757,6 +1027,11 @@
 | Logs | **ELK Stack** | Grafana Loki for simpler/cheaper; Datadog for managed |
 | API Gateway | **Kong** | AWS API Gateway for serverless; Traefik for Kubernetes |
 | Payments | **Stripe** | Adyen for enterprise scale; Razorpay for Pakistan/India |
+| Coordination | **etcd** | ZooKeeper for Kafka/HBase; Consul for microservice discovery |
+| IaC | **Terraform** | CloudFormation for AWS-only; Pulumi for real programming languages |
+| Config Mgmt | **Ansible** | Chef/Puppet for large enterprises; Salt for Python-heavy teams |
+| CI/CD | **GitHub Actions** | Jenkins for self-hosted; GitLab CI for self-hosted git+CI |
+| Secrets | **HashiCorp Vault** | AWS Secrets Manager for AWS-only; simpler but less portable |
 | ML Framework | **PyTorch** | TensorFlow for production serving; JAX for research |
 | ML Platform | **AWS SageMaker** | Google Vertex AI on GCP; Hugging Face for open models |
 | Blockchain | **Ethereum** | Solana for speed/low fees; Hyperledger for private enterprise chains |

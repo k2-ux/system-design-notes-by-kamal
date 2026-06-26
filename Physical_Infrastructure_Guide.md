@@ -19,7 +19,8 @@
 4. [Global Networking — How nodes connect worldwide](#4-global-networking)
 5. [Cloud vs. On-Premise / Regional Hardware](#5-cloud-vs-on-premise--regional)
 6. [Workload-Specific Silicon — HPC vs. AI/Deep Learning](#6-workload-specific-silicon)
-7. [Appendix — Mental Models, Latency Numbers & Glossary](#appendix)
+7. [Load Balancers — Hardware and Software](#7-load-balancers)
+8. [Appendix — Mental Models, Latency Numbers & Glossary](#appendix)
 
 ---
 
@@ -477,3 +478,183 @@ These "order of magnitude" numbers (after Jeff Dean's famous list, modernized) t
 ---
 
 *End of guide. This document covers the physical substrate beneath the logical abstractions you already know — the goal is that when you next say "add a read replica in eu-west" or "cache that in Redis," you can picture the actual silicon, drives, and fiber that makes it real.*
+
+---
+
+<a name="7-load-balancers"></a>
+## 7. Load Balancers
+
+### Q7.1 — What physically is a load balancer?
+
+**🟢 Beginner**
+
+A load balancer is a server whose only job is to forward requests to other servers — it never runs your application code itself. Think of it as a traffic cop standing in front of your building, directing each arriving visitor to a different door so no single door gets overwhelmed.
+
+```
+All users → [Load Balancer]
+                  │
+        ┌─────────┼─────────┐
+        ▼         ▼         ▼
+    [Server 1] [Server 2] [Server 3]
+```
+
+Without one, all traffic hits one server until it collapses. With one, you can add servers freely and the load balancer distributes the work automatically.
+
+**🟡 Intermediate**
+
+There are two kinds of load balancers — hardware and software:
+
+**Hardware Load Balancers:**
+```
+Physical appliance — a dedicated box, not a general-purpose server.
+Manufacturers: F5 BIG-IP, Citrix ADC (formerly NetScaler), A10 Networks.
+
+Physical form: 1U or 2U rack server, but with custom ASICs (chips)
+inside that handle packet forwarding in hardware at line rate.
+
+Specs of a typical F5 BIG-IP i15800:
+  Throughput:     320 Gbps
+  L7 requests/s:  12 million
+  SSL TPS:        3 million (SSL termination in hardware)
+  Price:          $100,000–$500,000 per unit
+
+Used by: banks, governments, telcos — anywhere the cost of downtime
+exceeds the cost of the appliance.
+```
+
+**Software Load Balancers:**
+```
+Just software running on a normal commodity server.
+Tools: Nginx, HAProxy, Envoy, AWS ALB/NLB, Cloudflare.
+
+A $5,000 server running Nginx can handle:
+  ~100,000 requests/second (L7 HTTP)
+  ~10 Gbps throughput
+
+Most companies use software load balancers — they are cheap,
+configurable, and can run on cloud VMs with zero hardware management.
+```
+
+**🔴 Advanced**
+
+Load balancers operate at different OSI layers — this determines what they can "see" and decide on:
+
+```
+Layer 4 (Transport) Load Balancer:
+  Sees: source IP, destination IP, TCP/UDP port — nothing else
+  Decides: which backend server to send the TCP connection to
+  Cannot: read HTTP headers, cookies, or URL paths
+  Speed: extremely fast — minimal processing per packet
+  Example: AWS NLB, HAProxy in TCP mode
+  Use when: raw throughput matters, protocol is not HTTP
+
+Layer 7 (Application) Load Balancer:
+  Sees: full HTTP request — URL, headers, cookies, body
+  Decides: route based on path (/api → API servers, /static → CDN)
+            route based on header (mobile user-agent → mobile servers)
+            sticky sessions (same user → same server via cookie)
+  Speed: slower than L4 — must parse HTTP for every request
+  Example: AWS ALB, Nginx, Envoy
+  Use when: you need intelligent routing, SSL termination, or path-based rules
+```
+
+### Q7.2 — How does a load balancer decide which server gets the request?
+
+**🟡 Intermediate**
+
+```
+Algorithm        How it works                           Best for
+───────────────────────────────────────────────────────────────────
+Round Robin      1→S1, 2→S2, 3→S3, 4→S1...            Equal servers, short requests
+Least Conn.      Send to server with fewest             Long-lived connections (WebSockets)
+                 active connections
+IP Hash          hash(client_ip) → always same server   Need same user on same server
+Weighted RR      S1 gets 60%, S2 gets 40%               Servers with different specs
+Random           Pick server at random                  Simple, surprisingly effective
+```
+
+### Q7.3 — What are health checks and why do they matter?
+
+**🟢 Beginner**
+
+The load balancer periodically sends a test request to each backend server:
+
+```
+Every 5 seconds:
+  LB → "GET /health HTTP/1.1" → Server 1 → 200 OK ✅ (alive, send traffic)
+  LB → "GET /health HTTP/1.1" → Server 2 → 200 OK ✅ (alive, send traffic)
+  LB → "GET /health HTTP/1.1" → Server 3 → no response ❌ (dead, stop sending)
+
+Server 3 crashes at 3am:
+  → Load balancer detects it within 5–15 seconds
+  → Automatically removes Server 3 from rotation
+  → Server 1 and 2 absorb all traffic
+  → Users experience zero downtime
+  → You sleep through it
+```
+
+**🔴 Advanced**
+
+```
+Health check types:
+  TCP check:   just verify the port is open (layer 4)
+  HTTP check:  verify /health returns 200 (layer 7, more meaningful)
+  Deep check:  /health queries DB + Redis + returns 200 only if all dependencies healthy
+
+Health check tuning:
+  Interval:           5s  (how often to check)
+  Timeout:            2s  (how long to wait for response)
+  Healthy threshold:  2   (consecutive successes before marking healthy)
+  Unhealthy threshold:3   (consecutive failures before marking unhealthy)
+
+Too aggressive (1s interval, 1 failure = remove):
+  → Flapping: brief network hiccup removes a perfectly healthy server
+
+Too lenient (60s interval, 10 failures = remove):
+  → Dead server serves traffic for 10 minutes before being removed
+```
+
+### Q7.4 — What is SSL termination and why does it happen at the load balancer?
+
+**🟡 Intermediate**
+
+```
+Without SSL termination at LB:
+  Client ──HTTPS──► LB ──HTTPS──► Server 1  (each server decrypts SSL)
+  Each server needs an SSL certificate and spends CPU on encryption/decryption
+
+With SSL termination at LB:
+  Client ──HTTPS──► LB ──HTTP──► Server 1   (LB decrypts, backend is plain HTTP)
+  Only the LB handles SSL — backend servers are relieved of CPU cost
+  One SSL certificate managed in one place (not on every server)
+
+Hardware LBs (F5) have dedicated SSL acceleration chips — handle millions
+of TLS handshakes/second without touching the main CPU.
+AWS ALB terminates SSL and forwards plain HTTP to your EC2 instances.
+```
+
+### Q7.5 — What is a VIP and how do load balancers stay highly available themselves?
+
+**🔴 Advanced**
+
+```
+The irony: a load balancer is a single point of failure — unless you
+run two of them in active-passive or active-active mode.
+
+VIP (Virtual IP):
+  A floating IP address that belongs to whichever LB is currently active.
+  
+  LB1 (active)  ← VIP: 1.2.3.4 pointed here
+  LB2 (standby) ← waiting
+
+  LB1 dies:
+  → LB2 detects failure via heartbeat (VRRP protocol)
+  → LB2 claims the VIP: 1.2.3.4 now points to LB2
+  → Failover takes < 1 second
+  → Users never notice
+
+Cloud managed LBs (AWS ALB, GCP LB):
+  AWS runs the HA for you — multiple LB nodes behind a single DNS name.
+  You never think about VIPs — the cloud handles it.
+  This is the main reason to use managed LBs over self-hosted Nginx.
+```
